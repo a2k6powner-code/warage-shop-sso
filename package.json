@@ -1,0 +1,8 @@
+{
+  "name": "mc-web-core",
+  "version": "1.0.0",
+  "description": "Minecraft 128-bit Token SSO and Item Transfer Module",
+  "main": "top.js",
+  "keywords": ["minecraft", "sso", "token", "shop"],
+  "author": "YourName"
+}
