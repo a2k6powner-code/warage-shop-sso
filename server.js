@@ -6,23 +6,28 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 // 引入业务模块
+const db = require('./db');           // 引入数据库 (新增接口需要直接查库)
 const mcAuth = require('./mcAuth');   // SSO + 基础交易
-const market = require('./market');   // 市场 + K线
+const market = require('./market');   // 市场 + K线 + 核心资产逻辑
 const catalog = require('./catalog'); // 分类目录
 
-const app = express();
+const app = express(); // <--- 关键：必须先在这里初始化 app
 
 // ================= 1. 全局配置 =================
 app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// 开发环境允许跨域 (解决本地文件访问 CORS 问题)
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || 'http://localhost:8080', 
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        return callback(null, true);
+    },
     credentials: true
 }));
 
-// 限流: 15分钟 100次 (测试时可调大)
+// 限流: 15分钟 100次
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     max: 100 
@@ -51,6 +56,46 @@ const verifyAdmin = (req, res, next) => {
 };
 
 // ================= 3. API 路由定义 =================
+
+// --- [新] 资产查询接口 ---
+/**
+ * 查询我的资产 (余额 + 库存)
+ */
+app.get('/api/assets/my', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    
+    try {
+        // 1. 查余额
+        const balance = market.getBalance(uuid);
+        
+        // 2. 查库存 (只查有的)
+        const inventory = db.prepare('SELECT item_id, amount FROM inventories WHERE uuid = ? AND amount > 0').all(uuid);
+        
+        res.json({ success: true, balance, inventory });
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: err.message }); 
+    }
+});
+
+// --- [新] 调试作弊接口 (给自己发钱/发货) ---
+app.post('/api/debug/give', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { type, itemId, amount } = req.body;
+    
+    // 如果你想限制这个接口只能管理员用，可以把 verifyAdmin 加到路由里
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+
+    try {
+        if (type === 'money') {
+            market._updateBalance(uuid, parseInt(amount));
+        } else if (type === 'item') {
+            market._updateInventory(uuid, itemId, parseInt(amount));
+        }
+        res.json({ success: true, msg: "作弊成功 (资产已到账)" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // --- SSO 身份验证模块 ---
 app.post('/api/internal/generate-token', verifyInternalApiKey, (req, res) => {
@@ -97,8 +142,7 @@ app.get('/api/market/orderbook', (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. [新] 获取 K 线数据 (TradingView格式)
-// 参数: resolution=60 (单位分钟)
+// 2. 获取 K 线数据
 app.get('/api/market/kline', (req, res) => {
     const { itemId, resolution } = req.query;
     if (!itemId) return res.status(400).json({ error: "Missing itemId" });
@@ -108,7 +152,7 @@ app.get('/api/market/kline', (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. 获取最新成交记录 (原始数据)
+// 3. 获取最新成交记录
 app.get('/api/market/trades', (req, res) => {
     const { itemId } = req.query;
     if (!itemId) return res.status(400).json({ error: "Missing itemId" });
@@ -136,6 +180,17 @@ app.post('/api/market/fulfill', (req, res) => {
     try {
         const result = market.fulfillOrder(uuid, orderId, parseInt(amount));
         res.json({ success: true, msg: "交易成功", data: result });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// 6. [新] 撤单 (退款/退货)
+app.post('/api/market/cancel', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { orderId } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        market.cancelOrder(uuid, orderId);
+        res.json({ success: true, msg: "撤单成功，资产已退回" });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -179,10 +234,10 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`
     ===========================================
-    全功能 Minecraft Shop 核心已启动
+    全功能 Minecraft Shop 核心已启动 (终极版)
     端口: ${PORT}
     数据库: SQLite (WAL模式)
-    功能: SSO, 商城, 市场(K线), 目录树
+    功能: SSO, 商城, 市场(K线+资金), 目录, 资产管理
     ===========================================
     `);
 });
