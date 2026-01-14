@@ -1,60 +1,102 @@
 const crypto = require('crypto');
+const db = require('./db');
+const { v4: uuidv4 } = require('uuid');
 
 class McAuthModule {
-    constructor() {
-        this.tokenDb = new Map();
-        this.purchaseQueue = []; // Web -> 游戏 (买入)
-        this.sellQueue = [];     // 游戏 -> Web (卖出)
-    }
+    
+    // 生成 Token
+    generateToken(playerUuid, expireMinutes = 10) {
+        const token = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + expireMinutes * 60 * 1000;
 
-    // --- 认证：生成 128位 Token ---
-    generateToken(playerUuid, expireMinutes = 5) {
-        const token = crypto.randomBytes(64).toString('hex');
-        const expiry = Date.now() + expireMinutes * 60 * 1000;
-        this.tokenDb.set(token, { uuid: playerUuid, expiry });
+        // 使用事务：清理过期 + 插入新 Token
+        const createTokenTx = db.transaction(() => {
+            db.prepare("DELETE FROM tokens WHERE expires_at < ?").run(Date.now());
+            db.prepare("INSERT INTO tokens (token, uuid, expires_at) VALUES (?, ?, ?)")
+              .run(token, playerUuid, expiresAt);
+        });
+
+        createTokenTx(); // 执行事务
         return token;
     }
 
-    // --- 认证：验证并销毁 Token ---
+    // 验证 Token
     verifyAndUse(token) {
-        const record = this.tokenDb.get(token);
-        if (!record || Date.now() > record.expiry) {
-            if (record) this.tokenDb.delete(token);
-            return null;
-        }
-        this.tokenDb.delete(token);
-        return record.uuid;
+        // 查+删 必须在一个原子操作里
+        let uuid = null;
+        
+        const verifyTx = db.transaction(() => {
+            const row = db.prepare("SELECT uuid, expires_at FROM tokens WHERE token = ?").get(token);
+            if (!row) return; // 不存在
+
+            // 立即删除 (一次性)
+            db.prepare("DELETE FROM tokens WHERE token = ?").run(token);
+
+            if (Date.now() <= row.expires_at) {
+                uuid = row.uuid;
+            }
+        });
+
+        verifyTx();
+        return uuid;
     }
 
-    // --- 买入：Web端下单 ---
+    // Web下单
     addPurchaseOrder(uuid, itemId) {
-        const order = {
-            orderId: crypto.randomBytes(4).toString('hex'),
-            uuid, itemId, time: new Date().toISOString()
-        };
-        this.purchaseQueue.push(order);
-        return order;
+        const orderId = uuidv4();
+        const time = new Date().toISOString();
+        
+        db.prepare("INSERT INTO purchase_queue (order_id, uuid, item_id, created_at) VALUES (?, ?, ?, ?)")
+          .run(orderId, uuid, itemId, time);
+          
+        return { orderId, uuid, itemId, time };
     }
 
-    // --- 买入：插件领取并清空 ---
-    getPendingPurchases() {
-        const orders = [...this.purchaseQueue];
-        this.purchaseQueue = [];
+    // [核心] 插件获取待领取物品
+    fetchPendingPurchases() {
+        let orders = [];
+
+        // 事务：读取 -> 删除
+        const fetchTx = db.transaction(() => {
+            // 1. 读取所有未领取订单
+            orders = db.prepare("SELECT * FROM purchase_queue WHERE claimed = 0").all();
+            
+            if (orders.length > 0) {
+                // 2. 物理删除 (防止重复领取)
+                // 也可以改为 UPDATE claimed = 1
+                const deleteStmt = db.prepare("DELETE FROM purchase_queue WHERE order_id = ?");
+                for (const order of orders) {
+                    deleteStmt.run(order.order_id);
+                }
+            }
+        });
+
+        fetchTx();
         return orders;
     }
 
-    // --- 卖出：插件提交数据 ---
+    // 提交出售请求
     submitSellRequest(uuid, itemId, amount) {
-        const record = { uuid, itemId, amount: parseInt(amount), time: new Date().toISOString() };
-        this.sellQueue.push(record);
-        return record;
+        const time = new Date().toISOString();
+        const info = db.prepare("INSERT INTO sell_queue (uuid, item_id, amount, created_at) VALUES (?, ?, ?, ?)")
+                       .run(uuid, itemId, amount, time);
+        return { id: info.lastInsertRowid, uuid, itemId, amount, time };
     }
 
-    // --- 卖出：网页结算并清空 ---
+    // Web端结算出售
     getPlayerSells(uuid) {
-        const playerSells = this.sellQueue.filter(s => s.uuid === uuid);
-        this.sellQueue = this.sellQueue.filter(s => s.uuid !== uuid);
-        return playerSells;
+        let items = [];
+        const sellTx = db.transaction(() => {
+            items = db.prepare("SELECT * FROM sell_queue WHERE uuid = ? AND processed = 0").all(uuid);
+            if (items.length > 0) {
+                const deleteStmt = db.prepare("DELETE FROM sell_queue WHERE id = ?");
+                for (const item of items) {
+                    deleteStmt.run(item.id);
+                }
+            }
+        });
+        sellTx();
+        return items;
     }
 }
 

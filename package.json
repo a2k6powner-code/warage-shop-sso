@@ -1,16 +1,18 @@
 {
-  "name": "mc-web-core",
-  "version": "1.0.0",
-  "description": "Minecraft 128-bit Token SSO and Item Transfer Module",
-  "main": "top.js",
-  "keywords": [
-    "minecraft",
-    "sso",
-    "token",
-    "shop"
-  ],
-  "author": "YourName",
+  "name": "mc-shop-core",
+  "version": "2.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "cors": "^2.8.5"
+    "axios": "^1.13.2",
+    "better-sqlite3": "^12.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "express-rate-limit": "^6.11.2",
+    "helmet": "^7.2.0",
+    "uuid": "^9.0.1"
   }
 }
