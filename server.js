@@ -6,19 +6,19 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 // 引入业务模块
-const db = require('./db');           // 引入数据库 (新增接口需要直接查库)
+const db = require('./db');           
 const mcAuth = require('./mcAuth');   // SSO + 基础交易
-const market = require('./market');   // 市场 + K线 + 核心资产逻辑
+const market = require('./market');   // 市场 + K线 + 资产 + 筹集令
 const catalog = require('./catalog'); // 分类目录
 
-const app = express(); // <--- 关键：必须先在这里初始化 app
+const app = express(); 
 
 // ================= 1. 全局配置 =================
 app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 开发环境允许跨域 (解决本地文件访问 CORS 问题)
+// 开发环境允许跨域 (解决本地文件/本地调试访问问题)
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
@@ -57,71 +57,81 @@ const verifyAdmin = (req, res, next) => {
 
 // ================= 3. API 路由定义 =================
 
-// --- [新] 资产查询接口 ---
-/**
- * 查询我的资产 (余额 + 库存)
- */
-app.get('/api/assets/my', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    
-    try {
-        // 1. 查余额
-        const balance = market.getBalance(uuid);
-        
-        // 2. 查库存 (只查有的)
-        const inventory = db.prepare('SELECT item_id, amount FROM inventories WHERE uuid = ? AND amount > 0').all(uuid);
-        
-        res.json({ success: true, balance, inventory });
-    } catch (err) { 
-        console.error(err);
-        res.status(500).json({ error: err.message }); 
-    }
-});
+// --- [新] 游戏插件专用接口 (Internal) ---
 
-// --- [新] 调试作弊接口 (给自己发钱/发货) ---
-app.post('/api/debug/give', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { type, itemId, amount } = req.body;
-    
-    // 如果你想限制这个接口只能管理员用，可以把 verifyAdmin 加到路由里
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-
-    try {
-        if (type === 'money') {
-            market._updateBalance(uuid, parseInt(amount));
-        } else if (type === 'item') {
-            market._updateInventory(uuid, itemId, parseInt(amount));
-        }
-        res.json({ success: true, msg: "作弊成功 (资产已到账)" });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// --- SSO 身份验证模块 ---
+// 1. 生成登录 Token (SSO)
 app.post('/api/internal/generate-token', verifyInternalApiKey, (req, res) => {
     try {
         const { uuid } = req.body;
-        if (!uuid) return res.status(400).json({ error: "Missing UUID" });
         const token = mcAuth.generateToken(uuid);
         res.json({ success: true, token, loginUrl: `http://localhost:${process.env.PORT||3000}/login?token=${token}` });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 2. 拉取待发货任务 (Web -> Game)
+app.get('/api/internal/fetch-purchases', verifyInternalApiKey, (req, res) => {
+    try { res.json({ orders: mcAuth.fetchPendingPurchases() }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 3. [新] 资产充值接口 (Game -> Web)
+// 插件调用此接口，将游戏内的钱或物品“存入”网页账户
+app.post('/api/internal/deposit', verifyInternalApiKey, (req, res) => {
+    try {
+        const { uuid, type, itemId, amount } = req.body;
+        
+        // 存钱
+        if (type === 'money') {
+            market._updateBalance(uuid, parseInt(amount));
+            console.log(`[充值] 玩家 ${uuid} 存入 $${amount}`);
+        } 
+        // 存物品
+        else if (type === 'item') {
+            market._updateInventory(uuid, itemId, parseInt(amount));
+            console.log(`[充值] 玩家 ${uuid} 存入物品 ${itemId} x${amount}`);
+        }
+        
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// --- 网页前端接口 (Web Frontend) ---
+
+// 1. 登录回调
 app.get('/login', (req, res) => {
     try {
         const uuid = mcAuth.verifyAndUse(req.query.token);
         if (!uuid) return res.status(403).send("Token无效或已过期");
-        res.send(`<h1>欢迎 ${uuid}</h1><script>localStorage.setItem('currentUser', '${uuid}');</script>`);
-    } catch (err) { res.status(500).send("Server Error"); }
+        // 简单返回，实际项目中这里通常重定向到前端页面
+        res.send(`<h1>欢迎 ${uuid}</h1><script>localStorage.setItem('currentUser', '${uuid}'); window.location.href='/';</script>`);
+    } catch (err) { res.status(500).send("Login Error"); }
 });
 
-// --- 基础商城模块 (管理员卖给玩家) ---
-app.get('/api/internal/fetch-purchases', verifyInternalApiKey, (req, res) => {
+// 2. 资产查询
+app.get('/api/assets/my', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    if (!uuid) return res.status(401).json({ error: "未登录" });
     try {
-        res.json({ orders: mcAuth.fetchPendingPurchases() });
+        const balance = market.getBalance(uuid);
+        const inventory = db.prepare('SELECT item_id, amount FROM inventories WHERE uuid = ? AND amount > 0').all(uuid);
+        res.json({ success: true, balance, inventory });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 3. 调试作弊 (给自己发钱/发货)
+app.post('/api/debug/give', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { type, itemId, amount } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        if (type === 'money') market._updateBalance(uuid, parseInt(amount));
+        else if (type === 'item') market._updateInventory(uuid, itemId, parseInt(amount));
+        res.json({ success: true, msg: "作弊成功" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- 基础商城 (管理员店) ---
 app.post('/api/shop/purchase', (req, res) => {
     const uuid = req.headers['x-user-uuid'];
     if (!uuid) return res.status(401).json({ error: "未登录" });
@@ -131,37 +141,22 @@ app.post('/api/shop/purchase', (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 自由市场模块 (玩家交易玩家) ---
-
-// 1. 获取订单簿 (深度图)
+// --- 自由市场 (现货 Spot) ---
 app.get('/api/market/orderbook', (req, res) => {
-    const { itemId } = req.query;
-    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
-    try {
-        res.json({ success: true, data: market.getOrderBook(itemId) });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { res.json({ success: true, data: market.getOrderBook(req.query.itemId) }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. 获取 K 线数据
 app.get('/api/market/kline', (req, res) => {
-    const { itemId, resolution } = req.query;
-    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
-    try {
-        const data = market.getKlineData(itemId, parseInt(resolution) || 60);
-        res.json({ success: true, data });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { res.json({ success: true, data: market.getKlineData(req.query.itemId, parseInt(req.query.resolution)||60) }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. 获取最新成交记录
 app.get('/api/market/trades', (req, res) => {
-    const { itemId } = req.query;
-    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
-    try {
-        res.json({ success: true, data: market.getTradeHistory(itemId) });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { res.json({ success: true, data: market.getTradeHistory(req.query.itemId) }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. 玩家挂单
 app.post('/api/market/place', (req, res) => {
     const uuid = req.headers['x-user-uuid'];
     const { itemId, type, price, amount } = req.body;
@@ -172,7 +167,6 @@ app.post('/api/market/place', (req, res) => {
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// 5. 玩家吃单 (成交)
 app.post('/api/market/fulfill', (req, res) => {
     const uuid = req.headers['x-user-uuid'];
     const { orderId, amount } = req.body;
@@ -183,61 +177,85 @@ app.post('/api/market/fulfill', (req, res) => {
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// 6. [新] 撤单 (退款/退货)
 app.post('/api/market/cancel', (req, res) => {
     const uuid = req.headers['x-user-uuid'];
     const { orderId } = req.body;
     if (!uuid) return res.status(401).json({ error: "未登录" });
     try {
         market.cancelOrder(uuid, orderId);
-        res.json({ success: true, msg: "撤单成功，资产已退回" });
+        res.json({ success: true, msg: "撤单成功" });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// --- 分类目录模块 (Catalog) ---
+// --- 物资筹集令 (公会收购 Procurement) ---
+app.get('/api/procurement/list', (req, res) => {
+    try { res.json({ success: true, data: market.getProcurementList('OPEN') }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-// 公共：获取分类树
+app.post('/api/procurement/create', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { itemId, price, targetAmount } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        const result = market.createProcurement(uuid, itemId, parseInt(price), parseInt(targetAmount));
+        res.json(result);
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/procurement/contribute', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { procurementId, amount } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        const result = market.contributeProcurement(uuid, parseInt(procurementId), parseInt(amount));
+        res.json(result);
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/procurement/cancel', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { procurementId } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        const result = market.cancelProcurement(uuid, procurementId);
+        res.json(result);
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// --- 分类目录 (Catalog) ---
 app.get('/api/catalog/tree', (req, res) => {
-    try {
-        res.json({ success: true, data: catalog.getCategoryTree() });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    try { res.json({ success: true, data: catalog.getCategoryTree() }); } 
+    catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 管理员：创建分类
 app.post('/api/admin/category', verifyAdmin, (req, res) => {
-    try {
-        const { parentId, name, sortOrder } = req.body;
-        res.json({ success: true, data: catalog.createCategory(parentId, name, sortOrder) });
-    } catch (err) { res.status(400).json({ error: err.message }); }
+    try { res.json({ success: true, data: catalog.createCategory(req.body.parentId, req.body.name, req.body.sortOrder) }); } 
+    catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// 管理员：删除分类
 app.delete('/api/admin/category', verifyAdmin, (req, res) => {
     try {
-        const { id } = req.query;
-        catalog.deleteCategory(id);
+        catalog.deleteCategory(req.query.id);
         res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// 管理员：添加/移动物品
 app.post('/api/admin/item', verifyAdmin, (req, res) => {
     try {
-        const { categoryId, itemId, displayName, iconUrl } = req.body;
-        catalog.addItemToCategory(categoryId, itemId, displayName, iconUrl);
+        catalog.addItemToCategory(req.body.categoryId, req.body.itemId, req.body.displayName, req.body.iconUrl);
         res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ================= 4. 启动服务 =================
+// ================= 4. 启动 =================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`
     ===========================================
-    全功能 Minecraft Shop 核心已启动 (终极版)
+    全功能 Minecraft Shop 核心已启动 (V2.0 双向资产版)
     端口: ${PORT}
-    数据库: SQLite (WAL模式)
-    功能: SSO, 商城, 市场(K线+资金), 目录, 资产管理
+    功能: SSO, 基础商城, 现货市场, 筹集令, 资产充提
     ===========================================
     `);
 });

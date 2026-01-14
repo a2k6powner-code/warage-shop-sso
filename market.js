@@ -3,18 +3,23 @@ const db = require('./db');
 
 class MarketModule {
 
-    // --- 辅助：获取玩家资产 ---
+    // ==========================================
+    // A. 资产基础操作 (内部/外部通用)
+    // ==========================================
+    
+    // 查询余额
     getBalance(uuid) {
         const row = db.prepare('SELECT balance FROM wallets WHERE uuid = ?').get(uuid);
         return row ? row.balance : 0;
     }
 
+    // 查询某物品库存
     getItemAmount(uuid, itemId) {
         const row = db.prepare('SELECT amount FROM inventories WHERE uuid = ? AND item_id = ?').get(uuid, itemId);
         return row ? row.amount : 0;
     }
 
-    // --- 辅助：变动资产 (内部使用) ---
+    // 变动余额 (支持正负)
     _updateBalance(uuid, delta) {
         db.prepare(`
             INSERT INTO wallets (uuid, balance) VALUES (?, ?)
@@ -22,6 +27,7 @@ class MarketModule {
         `).run(uuid, delta, delta);
     }
 
+    // 变动库存 (支持正负)
     _updateInventory(uuid, itemId, delta) {
         db.prepare(`
             INSERT INTO inventories (uuid, item_id, amount) VALUES (?, ?, ?)
@@ -29,101 +35,81 @@ class MarketModule {
         `).run(uuid, itemId, delta, delta);
     }
 
-    // --- 1. 获取订单簿 ---
+    // ==========================================
+    // B. 现货交易市场 (Order Book)
+    // ==========================================
+
+    // 1. 获取订单簿
     getOrderBook(itemId) {
         const asks = db.prepare(`SELECT id, uuid, price, amount, created_at FROM orders WHERE item_id = ? AND type = 'SELL' AND status = 'OPEN' ORDER BY price ASC LIMIT 50`).all(itemId);
         const bids = db.prepare(`SELECT id, uuid, price, amount, created_at FROM orders WHERE item_id = ? AND type = 'BUY' AND status = 'OPEN' ORDER BY price DESC LIMIT 50`).all(itemId);
         return { itemId, asks, bids };
     }
 
-    // --- 2. 玩家挂单 (Maker - 需预扣资产) ---
+    // 2. 挂单 (Maker) - 冻结资产
     placeOrder(uuid, itemId, type, price, amount) {
-        if (amount <= 0 || price <= 0) throw new Error("价格和数量必须大于0");
+        if (amount <= 0 || price <= 0) throw new Error("数值必须大于0");
         if (!['BUY', 'SELL'].includes(type)) throw new Error("类型错误");
 
-        const insertTx = db.transaction(() => {
+        const tx = db.transaction(() => {
             const time = new Date().toISOString();
             
             if (type === 'BUY') {
-                // 买单：预扣钱
                 const totalCost = price * amount;
                 const balance = this.getBalance(uuid);
-                if (balance < totalCost) throw new Error(`余额不足 (需要 ${totalCost}, 只有 ${balance})`);
-                
+                if (balance < totalCost) throw new Error(`余额不足 (需 ${totalCost}, 剩 ${balance})`);
                 this._updateBalance(uuid, -totalCost);
             } else {
-                // 卖单：预扣货
                 const inv = this.getItemAmount(uuid, itemId);
-                if (inv < amount) throw new Error(`库存不足 (需要 ${amount}个 ${itemId}, 只有 ${inv})`);
-                
+                if (inv < amount) throw new Error(`库存不足 (需 ${amount}, 剩 ${inv})`);
                 this._updateInventory(uuid, itemId, -amount);
             }
 
-            // 写入订单
             db.prepare(`
                 INSERT INTO orders (uuid, item_id, type, price, amount, initial_amount, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             `).run(uuid, itemId, type, price, amount, amount, time, time);
         });
 
-        insertTx();
-        return { success: true, msg: "挂单成功 (资产已冻结)" };
+        tx();
+        return { success: true, msg: "挂单成功" };
     }
 
-    // --- 3. 吃单/成交 (Taker - 钱货两清) ---
+    // 3. 吃单 (Taker) - 撮合交易
     fulfillOrder(takerUuid, orderId, amount) {
         if (amount <= 0) throw new Error("数量必须大于0");
 
-        const tradeTx = db.transaction(() => {
-            // A. 锁定目标订单
+        const tx = db.transaction(() => {
             const order = db.prepare(`SELECT * FROM orders WHERE id = ? AND status = 'OPEN'`).get(orderId);
             
             if (!order) throw new Error("订单不存在或已成交");
             if (order.uuid === takerUuid) throw new Error("不能交易自己的订单"); 
-            if (order.amount < amount) throw new Error(`订单剩余不足 (仅剩 ${order.amount})`);
+            if (order.amount < amount) throw new Error(`订单剩余不足 (剩 ${order.amount})`);
 
             const makerUuid = order.uuid;
             const itemId = order.item_id;
             const price = order.price;
             const totalMoney = price * amount;
 
-            // B. 资金/物品划转逻辑 (核心)
             if (order.type === 'SELL') {
-                // 目标是卖单 (Maker是卖家，已经扣了货)
-                // 我是买家 (Taker)，我需要出钱
-                
-                // 1. 扣我的钱
+                // 目标是卖单。我是买家，我出钱。
                 const myBalance = this.getBalance(takerUuid);
-                if (myBalance < totalMoney) throw new Error(`余额不足 (需要 ${totalMoney}, 只有 ${myBalance})`);
-                this._updateBalance(takerUuid, -totalMoney);
-
-                // 2. 给卖家钱
-                this._updateBalance(makerUuid, totalMoney);
-
-                // 3. 给我货
-                this._updateInventory(takerUuid, itemId, amount);
+                if (myBalance < totalMoney) throw new Error(`余额不足 (需 ${totalMoney})`);
                 
-                // (卖家的货在挂单时已经扣了，不用管)
-
+                this._updateBalance(takerUuid, -totalMoney); // 扣我钱
+                this._updateBalance(makerUuid, totalMoney);  // 给卖家钱
+                this._updateInventory(takerUuid, itemId, amount); // 给我货
             } else {
-                // 目标是买单 (Maker是买家，已经扣了钱)
-                // 我是卖家 (Taker)，我需要出货
-
-                // 1. 扣我的货
+                // 目标是买单。我是卖家，我出货。
                 const myInv = this.getItemAmount(takerUuid, itemId);
-                if (myInv < amount) throw new Error(`库存不足 (需要 ${amount}, 只有 ${myInv})`);
-                this._updateInventory(takerUuid, itemId, -amount);
+                if (myInv < amount) throw new Error(`库存不足 (需 ${amount})`);
 
-                // 2. 给买家货
-                this._updateInventory(makerUuid, itemId, amount);
-
-                // 3. 给我钱
-                this._updateBalance(takerUuid, totalMoney);
-
-                // (买家的钱在挂单时已经扣了，不用管)
+                this._updateInventory(takerUuid, itemId, -amount); // 扣我货
+                this._updateInventory(makerUuid, itemId, amount);  // 给买家货
+                this._updateBalance(takerUuid, totalMoney); // 给我钱
             }
-            
-            // C. 更新订单状态
+
+            // 更新订单状态
             const newAmount = order.amount - amount;
             const newStatus = newAmount === 0 ? 'FILLED' : 'OPEN';
             const time = new Date().toISOString();
@@ -131,65 +117,158 @@ class MarketModule {
             db.prepare(`UPDATE orders SET amount = ?, status = ?, updated_at = ? WHERE id = ?`)
               .run(newAmount, newStatus, time, orderId);
 
-            // D. 记录成交历史
+            // 记录 K 线数据源
             db.prepare(`
                 INSERT INTO trades (buy_order_id, sell_order_id, item_id, price, amount, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
-            `).run(
-                order.type === 'BUY' ? order.id : null,   
-                order.type === 'SELL' ? order.id : null,  
-                itemId, price, amount, time
-            );
+            `).run(order.type === 'BUY' ? order.id : null, order.type === 'SELL' ? order.id : null, itemId, price, amount, time);
 
             return { price, amount, total: totalMoney };
         });
 
-        return tradeTx();
+        return tx();
     }
-    
-    // --- 4. 撤单 (Maker - 退还资产) ---
-    // 这个功能之前没写，但有了扣款就必须有退款
-    cancelOrder(uuid, orderId) {
-        const cancelTx = db.transaction(() => {
-            const order = db.prepare(`SELECT * FROM orders WHERE id = ? AND uuid = ? AND status = 'OPEN'`).get(orderId, uuid);
-            if (!order) throw new Error("订单不存在或无法撤销");
 
-            // 退还资产
+    // 4. 撤单 - 退还资产
+    cancelOrder(uuid, orderId) {
+        const tx = db.transaction(() => {
+            const order = db.prepare(`SELECT * FROM orders WHERE id = ? AND uuid = ? AND status = 'OPEN'`).get(orderId, uuid);
+            if (!order) throw new Error("订单无法撤销");
+
             if (order.type === 'BUY') {
-                // 撤买单：退钱
                 const refund = order.price * order.amount;
                 this._updateBalance(uuid, refund);
             } else {
-                // 撤卖单：退货
                 this._updateInventory(uuid, order.item_id, order.amount);
             }
 
-            // 标记为已撤销
             db.prepare(`UPDATE orders SET status = 'CANCELLED', updated_at = ? WHERE id = ?`)
               .run(new Date().toISOString(), orderId);
         });
-        cancelTx();
+        tx();
         return { success: true };
     }
 
-    // --- 其他查询方法保持不变 ---
-    getTradeHistory(itemId) { /* ...同前... */ return db.prepare(`SELECT price, amount, created_at FROM trades WHERE item_id = ? ORDER BY created_at DESC LIMIT 100`).all(itemId); }
-    getKlineData(itemId, resolution = 60) { /* ...同前，请保留修正后的聚合逻辑... */ 
-        // 这里为了节省篇幅简写了，请务必把上一条回复里修正过的 getKlineData 逻辑贴回来！
-        // 如果你需要我再贴一遍完整的，请告诉我。
+    // ==========================================
+    // C. 物资筹集令 (公会收购系统)
+    // ==========================================
+
+    // 5. 获取筹集令列表
+    getProcurementList(status = 'OPEN') {
+        return db.prepare(`SELECT * FROM procurements WHERE status = ? ORDER BY created_at DESC`).all(status);
+    }
+
+    // 6. 发布筹集令 (全款冻结)
+    createProcurement(uuid, itemId, price, targetAmount) {
+        if (price <= 0 || targetAmount <= 0) throw new Error("价格和数量必须大于0");
+        
+        return db.transaction(() => {
+            const totalCost = price * targetAmount;
+            const balance = this.getBalance(uuid);
+            if (balance < totalCost) throw new Error(`余额不足以支付收购保证金 (需 ${totalCost})`);
+            
+            this._updateBalance(uuid, -totalCost);
+
+            const info = db.prepare(`
+                INSERT INTO procurements (uuid, item_id, price_per_unit, target_amount, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(uuid, itemId, price, targetAmount, new Date().toISOString());
+
+            return { success: true, id: info.lastInsertRowid, msg: "收购令发布成功" };
+        })();
+    }
+
+    // 7. 散人交货 (立刻拿钱)
+    contributeProcurement(contributorUuid, procurementId, amount) {
+        if (amount <= 0) throw new Error("数量必须大于0");
+
+        return db.transaction(() => {
+            // --- 修复点：双引号 "OPEN" 改为单引号 'OPEN' ---
+            const order = db.prepare("SELECT * FROM procurements WHERE id = ? AND status = 'OPEN'").get(procurementId);
+            
+            if (!order) throw new Error("订单不存在或已结束");
+
+            const remaining = order.target_amount - order.filled_amount;
+            if (amount > remaining) throw new Error(`收购溢出，当前只收 ${remaining} 个`);
+
+            const inv = this.getItemAmount(contributorUuid, order.item_id);
+            if (inv < amount) throw new Error("背包货不足");
+
+            // 1. 扣散人货
+            this._updateInventory(contributorUuid, order.item_id, -amount);
+            
+            // 2. 给散人钱
+            const earnings = order.price_per_unit * amount;
+            this._updateBalance(contributorUuid, earnings);
+
+            // 3. 货直接存入发起人仓库
+            this._updateInventory(order.uuid, order.item_id, amount);
+
+            // 4. 更新进度
+            const newFilled = order.filled_amount + amount;
+            const newStatus = newFilled >= order.target_amount ? 'FILLED' : 'OPEN';
+            db.prepare("UPDATE procurements SET filled_amount = ?, status = ? WHERE id = ?")
+              .run(newFilled, newStatus, procurementId);
+
+            // 5. 记录日志
+            db.prepare(`
+                INSERT INTO procurement_records (procurement_id, contributor_uuid, amount, earnings, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(procurementId, contributorUuid, amount, earnings, new Date().toISOString());
+
+            return { success: true, earnings };
+        })();
+    }
+
+    // 8. 撤销筹集令 (退还剩余资金)
+    cancelProcurement(uuid, procurementId) {
+        return db.transaction(() => {
+            // --- 修复点：双引号 "OPEN" 改为单引号 'OPEN' ---
+            const order = db.prepare("SELECT * FROM procurements WHERE id = ? AND uuid = ? AND status = 'OPEN'").get(procurementId, uuid);
+            
+            if (!order) throw new Error("无法撤销");
+
+            // 计算应退款项
+            const remaining = order.target_amount - order.filled_amount;
+            if (remaining > 0) {
+                const refund = remaining * order.price_per_unit;
+                this._updateBalance(uuid, refund);
+            }
+
+            // --- 修复点：双引号 "CANCELLED" 改为单引号 'CANCELLED' ---
+            db.prepare("UPDATE procurements SET status = 'CANCELLED' WHERE id = ?").run(procurementId);
+            return { success: true, msg: "撤销成功，剩余资金已退回" };
+        })();
+    }
+
+    // ==========================================
+    // D. 数据图表 (K线)
+    // ==========================================
+
+    getTradeHistory(itemId) {
+        return db.prepare(`SELECT price, amount, created_at FROM trades WHERE item_id = ? ORDER BY created_at DESC LIMIT 100`).all(itemId);
+    }
+
+    getKlineData(itemId, resolution = 60) {
         const trades = db.prepare(`SELECT price, amount, created_at FROM trades WHERE item_id = ? ORDER BY created_at ASC`).all(itemId);
         if (trades.length === 0) return [];
+
         const klines = [];
         let currentCandle = null;
         let lastBucketTime = 0;
         const intervalMs = resolution * 60 * 1000;
+
         for (const trade of trades) {
             const tradeTime = new Date(trade.created_at).getTime();
             const bucketTime = Math.floor(tradeTime / intervalMs) * intervalMs;
+
             if (currentCandle === null || bucketTime !== lastBucketTime) {
                 if (currentCandle) klines.push(currentCandle);
                 lastBucketTime = bucketTime;
-                currentCandle = { time: bucketTime / 1000, open: trade.price, high: trade.price, low: trade.price, close: trade.price, volume: trade.amount };
+                currentCandle = {
+                    time: bucketTime / 1000,
+                    open: trade.price, high: trade.price, low: trade.price, close: trade.price, volume: trade.amount
+                };
             } else {
                 currentCandle.high = Math.max(currentCandle.high, trade.price);
                 currentCandle.low = Math.min(currentCandle.low, trade.price);
