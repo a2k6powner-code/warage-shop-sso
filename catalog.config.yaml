@@ -1,0 +1,53 @@
+# ==========================================
+# 商品分类目录配置文件
+# 格式说明：
+# - name: 分类名称
+#   sort: 排序权重 (数字越小越靠前)
+#   items: 该分类下的物品列表
+#     - id: 游戏内物品ID (如 diamond_sword)
+#       name: 显示名称
+#       icon: 图标URL (可选)
+#   children: 子分类列表 (可以无限嵌套)
+# ==========================================
+
+# 顶级分类 1：战斗舰船
+- name: "战斗舰船"
+  sort: 1
+  children:
+    # 子分类：巡洋舰
+    - name: "巡洋舰"
+      sort: 1
+      items:
+        - id: "cruiser_thorax"
+          name: "托勒克斯级巡洋舰"
+          icon: "http://example.com/icon1.png"
+        - id: "cruiser_omen"
+          name: "奥蒙级巡洋舰"
+    
+    # 子分类：战列舰
+    - name: "战列舰"
+      sort: 2
+      items:
+        - id: "battleship_mega"
+          name: "万王宝座级"
+
+# 顶级分类 2：工业舰船
+- name: "工业舰船"
+  sort: 2
+  children:
+    - name: "采矿驳船"
+      sort: 1
+      items:
+        - id: "barge_retriever"
+          name: "回旋者级"
+
+# 顶级分类 3：装备与弹药
+- name: "装备与弹药"
+  sort: 3
+  children:
+    - name: "混合炮台"
+      children:
+        - name: "大型混合炮"
+          items:
+            - id: "turret_neutron_l"
+              name: "大型中子疾速炮"

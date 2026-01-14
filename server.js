@@ -1,159 +1,188 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const mcAuth = require('./mcAuth');
+
+// 引入业务模块
+const mcAuth = require('./mcAuth');   // SSO + 基础交易
+const market = require('./market');   // 市场 + K线
+const catalog = require('./catalog'); // 分类目录
 
 const app = express();
 
-// --- 安全配置 ---
-app.use(helmet()); // 防止常见 HTTP 头攻击
+// ================= 1. 全局配置 =================
+app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 严格的 CORS 配置
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || 'http://localhost:8080', // 仅允许前端域名
+    origin: process.env.CORS_ORIGIN || 'http://localhost:8080', 
     credentials: true
 }));
 
-// 速率限制 (防止 DDoS 和 暴力破解)
+// 限流: 15分钟 100次 (测试时可调大)
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15分钟
-    max: 100 // 每个IP限制100次请求
+    windowMs: 15 * 60 * 1000, 
+    max: 100 
 });
 app.use(limiter);
 
-// --- 中间件：内部 API 鉴权 ---
-// 任何 /api/internal/ 开头的请求必须携带正确的 API Key
+// ================= 2. 鉴权中间件 =================
+
+// A. 内部接口鉴权 (给游戏插件用)
 const verifyInternalApiKey = (req, res, next) => {
     const apiKey = req.headers['x-api-key'] || req.query.key;
     if (apiKey !== process.env.INTERNAL_API_KEY) {
-        console.warn(`[安全警报] IP ${req.ip} 尝试非法访问内部接口`);
         return res.status(403).json({ error: "Forbidden: Invalid API Key" });
     }
     next();
 };
 
-// --- API 路由 ---
+// B. 管理员鉴权 (给后台管理分类用)
+const verifyAdmin = (req, res, next) => {
+    const uuid = req.headers['x-user-uuid'];
+    const adminList = (process.env.ADMIN_UUIDS || '').split(',');
+    if (!uuid || !adminList.includes(uuid)) {
+        return res.status(403).json({ error: "Forbidden: 需要管理员权限" });
+    }
+    next();
+};
 
-/**
- * 1. 生成 Token (已移至内部接口！)
- * 只有可信的游戏服务器插件才能请求生成 Token，玩家不能自己生成。
- * 插件调用此接口获取 Token，然后发给玩家点击链接。
- */
-app.post('/api/internal/generate-token', verifyInternalApiKey, async (req, res) => {
+// ================= 3. API 路由定义 =================
+
+// --- SSO 身份验证模块 ---
+app.post('/api/internal/generate-token', verifyInternalApiKey, (req, res) => {
     try {
         const { uuid } = req.body;
         if (!uuid) return res.status(400).json({ error: "Missing UUID" });
-        
-        const token = await mcAuth.generateToken(uuid);
-        // 返回完整的登录 URL 给插件，插件显示给玩家
-        const loginUrl = `http://localhost:${process.env.PORT}/login?token=${token}`;
-        res.json({ success: true, token, loginUrl });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        const token = mcAuth.generateToken(uuid);
+        res.json({ success: true, token, loginUrl: `http://localhost:${process.env.PORT||3000}/login?token=${token}` });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/**
- * 2. 玩家登录处理
- * 验证 Token 并设置简单的 Cookie/Session 标识
- */
-app.get('/login', async (req, res) => {
-    const { token } = req.query;
-    if (!token) return res.status(400).send("Token缺失");
-
+app.get('/login', (req, res) => {
     try {
-        const uuid = await mcAuth.verifyAndUse(token);
-        if (!uuid) return res.status(403).send("链接失效或已过期，请在游戏中重新输入命令获取");
-        
-        // 简单模拟 Session，实际建议使用 JWT 或 express-session
-        // 这里为了演示，直接设置一个签名的 Cookie (需配合 cookie-parser，此处简化)
-        // 在生产环境中，你应该发放一个 JWT 给前端
-        res.send(`
-            <h1>登录成功</h1>
-            <p>欢迎玩家: ${uuid}</p>
-            <script>
-                // 模拟将用户信息存入 LocalStorage，供前端使用
-                localStorage.setItem('currentUser', '${uuid}');
-                window.location.href = '${process.env.CORS_ORIGIN}/shop'; 
-            </script>
-        `);
-    } catch (err) {
-        res.status(500).send("服务器内部错误");
-    }
+        const uuid = mcAuth.verifyAndUse(req.query.token);
+        if (!uuid) return res.status(403).send("Token无效或已过期");
+        res.send(`<h1>欢迎 ${uuid}</h1><script>localStorage.setItem('currentUser', '${uuid}');</script>`);
+    } catch (err) { res.status(500).send("Server Error"); }
 });
 
-/**
- * 3. 插件拉取待发货订单 (内部接口)
- */
-app.get('/api/internal/fetch-purchases', verifyInternalApiKey, async (req, res) => {
+// --- 基础商城模块 (管理员卖给玩家) ---
+app.get('/api/internal/fetch-purchases', verifyInternalApiKey, (req, res) => {
     try {
-        const orders = await mcAuth.fetchPendingPurchases();
-        res.json({ count: orders.length, orders });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        res.json({ orders: mcAuth.fetchPendingPurchases() });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/**
- * 4. 插件提交玩家出售记录 (内部接口)
- */
-app.post('/api/internal/submit-sell', verifyInternalApiKey, async (req, res) => {
+app.post('/api/shop/purchase', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    if (!uuid) return res.status(401).json({ error: "未登录" });
     try {
-        const { uuid, itemId, amount } = req.body;
-        if (!uuid || !itemId || !amount) return res.status(400).json({ error: "参数不全" });
-        
-        const record = await mcAuth.submitSellRequest(uuid, itemId, amount);
-        res.json({ success: true, record });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        const order = mcAuth.addPurchaseOrder(uuid, req.body.itemId);
+        res.json({ success: true, order });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/**
- * 5. Web端接口：玩家购买物品
- * (实际项目中这里应该验证 JWT 或 Session)
- */
-app.post('/api/shop/purchase', async (req, res) => {
-    // 简化：假设前端在 Header 里传了用户 UUID (不安全，实际请用 JWT)
-    const uuid = req.headers['x-user-uuid']; 
-    const { itemId } = req.body;
+// --- 自由市场模块 (玩家交易玩家) ---
 
-    if (!uuid || !itemId) return res.status(401).json({ error: "未授权或参数错误" });
-
+// 1. 获取订单簿 (深度图)
+app.get('/api/market/orderbook', (req, res) => {
+    const { itemId } = req.query;
+    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
     try {
-        const order = await mcAuth.addPurchaseOrder(uuid, itemId);
-        res.json({ success: true, msg: "下单成功，请在游戏内查收", order });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        res.json({ success: true, data: market.getOrderBook(itemId) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/**
- * 6. Web端接口：查询出售收益
- */
-app.get('/api/shop/earnings', async (req, res) => {
-    const uuid = req.headers['x-user-uuid']; // 同样，实际请用 JWT
-    if (!uuid) return res.status(401).json({ error: "未授权" });
-
+// 2. [新] 获取 K 线数据 (TradingView格式)
+// 参数: resolution=60 (单位分钟)
+app.get('/api/market/kline', (req, res) => {
+    const { itemId, resolution } = req.query;
+    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
     try {
-        const items = await mcAuth.getPlayerSells(uuid);
-        res.json({ success: true, items });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        const data = market.getKlineData(itemId, parseInt(resolution) || 60);
+        res.json({ success: true, data });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 3. 获取最新成交记录 (原始数据)
+app.get('/api/market/trades', (req, res) => {
+    const { itemId } = req.query;
+    if (!itemId) return res.status(400).json({ error: "Missing itemId" });
+    try {
+        res.json({ success: true, data: market.getTradeHistory(itemId) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 4. 玩家挂单
+app.post('/api/market/place', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { itemId, type, price, amount } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        const result = market.placeOrder(uuid, itemId, type, parseInt(price), parseInt(amount));
+        res.json(result);
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// 5. 玩家吃单 (成交)
+app.post('/api/market/fulfill', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    const { orderId, amount } = req.body;
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    try {
+        const result = market.fulfillOrder(uuid, orderId, parseInt(amount));
+        res.json({ success: true, msg: "交易成功", data: result });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// --- 分类目录模块 (Catalog) ---
+
+// 公共：获取分类树
+app.get('/api/catalog/tree', (req, res) => {
+    try {
+        res.json({ success: true, data: catalog.getCategoryTree() });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 管理员：创建分类
+app.post('/api/admin/category', verifyAdmin, (req, res) => {
+    try {
+        const { parentId, name, sortOrder } = req.body;
+        res.json({ success: true, data: catalog.createCategory(parentId, name, sortOrder) });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// 管理员：删除分类
+app.delete('/api/admin/category', verifyAdmin, (req, res) => {
+    try {
+        const { id } = req.query;
+        catalog.deleteCategory(id);
+        res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// 管理员：添加/移动物品
+app.post('/api/admin/item', verifyAdmin, (req, res) => {
+    try {
+        const { categoryId, itemId, displayName, iconUrl } = req.body;
+        catalog.addItemToCategory(categoryId, itemId, displayName, iconUrl);
+        res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ================= 4. 启动服务 =================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`
     ===========================================
-    安全版 Minecraft Shop SSO 核心已启动
+    全功能 Minecraft Shop 核心已启动
     端口: ${PORT}
-    数据库: SQLite (本地文件)
+    数据库: SQLite (WAL模式)
+    功能: SSO, 商城, 市场(K线), 目录树
     ===========================================
     `);
 });

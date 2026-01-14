@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>物品价格走势 (Steam风格)</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        /* 1. 整体深色背景，无边框设计 */
+        body { background: #0d0d0d; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        
+        /* 2. 控制栏样式优化 */
+        .controls { margin-bottom: 20px; background: #1e1e1e; padding: 10px 20px; border-radius: 8px; display: flex; gap: 10px; align-items: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        input { background: #2d2d2d; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px; outline: none; }
+        input:focus { border-color: #2962ff; }
+        button { background: #2962ff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        button:hover { background: #1e4bd6; }
+
+        /* 3. 图表容器：增加发光效果 */
+        #chart { width: 900px; height: 450px; border-radius: 8px; overflow: hidden; box-shadow: 0 0 20px rgba(41, 98, 255, 0.1); }
+    </style>
+</head>
+<body>
+
+    <div class="controls">
+        <label>物品 ID: </label>
+        <input type="text" id="itemId" value="diamond_sword">
+        <button onclick="loadChart()">查询走势</button>
+        <span id="status" style="margin-left: 10px; font-size: 14px; color: #888;"></span>
+    </div>
+
+    <div id="chart"></div>
+
+    <script>
+        const chartContainer = document.getElementById('chart');
+        
+        // --- 1. 创建图表：极简风格 ---
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: {
+                background: { type: 'solid', color: '#131722' }, // 深空灰背景
+                textColor: '#d1d4dc',
+            },
+            grid: {
+                vertLines: { visible: false }, // 隐藏竖向网格，更干净
+                horzLines: { color: '#2B2B43', style: 3 }, // 横向网格虚线
+            },
+            rightPriceScale: {
+                borderColor: '#2B2B43',
+            },
+            timeScale: {
+                borderColor: '#2B2B43',
+                timeVisible: true,
+            },
+            crosshair: {
+                vertLine: { labelVisible: false }, // 隐藏十字准星的标签，减少干扰
+            },
+        });
+
+        // --- 2. 使用“面积图”代替K线 ---
+        // 这种图表只有一条线，下面有渐变色，非常像 Steam 市场
+        const areaSeries = chart.addAreaSeries({
+            topColor: 'rgba(41, 98, 255, 0.56)', // 顶部颜色 (亮蓝)
+            bottomColor: 'rgba(41, 98, 255, 0.04)', // 底部颜色 (透明)
+            lineColor: 'rgba(41, 98, 255, 1)',      // 线条颜色 (实蓝)
+            lineWidth: 2,
+        });
+
+        async function loadChart() {
+            const itemId = document.getElementById('itemId').value;
+            const statusEl = document.getElementById('status');
+            
+            statusEl.innerText = `加载中...`;
+
+            try {
+                // 使用后端做好的 K 线接口
+                const res = await fetch(`http://localhost:3000/api/market/kline?itemId=${itemId}&resolution=60`);
+                const json = await res.json();
+
+                if (json.success) {
+                    const klineData = json.data;
+                    
+                    if (klineData.length === 0) {
+                        statusEl.innerText = "暂无数据";
+                        areaSeries.setData([]);
+                        return;
+                    }
+
+                    // --- 关键转换 ---
+                    // 面积图只需要 time 和 value (我们用收盘价 close 作为 value)
+                    const areaData = klineData.map(item => ({
+                        time: item.time,
+                        value: item.close // 只取收盘价
+                    }));
+
+                    areaSeries.setData(areaData);
+                    chart.timeScale().fitContent();
+                    
+                    // 动态更新颜色：如果最新价格比开始价格高，用绿色；否则用红色 (可选)
+                    const firstPrice = areaData[0].value;
+                    const lastPrice = areaData[areaData.length - 1].value;
+                    if (lastPrice >= firstPrice) {
+                        // 涨：改为绿色基调
+                        areaSeries.applyOptions({
+                            lineColor: '#00E396', topColor: 'rgba(0, 227, 150, 0.56)', bottomColor: 'rgba(0, 227, 150, 0.04)'
+                        });
+                    } else {
+                        // 跌：改为红色基调
+                        areaSeries.applyOptions({
+                            lineColor: '#FF4560', topColor: 'rgba(255, 69, 96, 0.56)', bottomColor: 'rgba(255, 69, 96, 0.04)'
+                        });
+                    }
+
+                    statusEl.innerText = `最新价: ${lastPrice}`;
+                    statusEl.style.color = lastPrice >= firstPrice ? '#00E396' : '#FF4560';
+
+                } else {
+                    statusEl.innerText = "错误: " + json.error;
+                }
+            } catch (err) {
+                console.error(err);
+                statusEl.innerText = "网络请求失败";
+            }
+        }
+        
+        // 自动加载一次
+        loadChart();
+    </script>
+</body>
+</html>

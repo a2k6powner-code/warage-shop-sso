@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>物品 K 线图测试 (v4稳定版)</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { background: #1a1a1a; color: #fff; font-family: sans-serif; padding: 20px; }
+        #chart { width: 800px; height: 400px; border: 1px solid #333; margin-top: 20px; }
+        .controls { margin-bottom: 10px; }
+        input { padding: 5px; }
+        button { padding: 5px 10px; cursor: pointer; background: #2196F3; border: none; color: white; }
+        button:hover { background: #1976D2; }
+    </style>
+</head>
+<body>
+
+    <div class="controls">
+        <label>物品ID: </label>
+        <input type="text" id="itemId" value="diamond_sword">
+        <button onclick="loadChart()">加载 K 线</button>
+        <span id="status" style="margin-left: 10px; color: #aaa;"></span>
+    </div>
+
+    <div id="chart"></div>
+
+    <script>
+        // --- 1. 初始化图表 ---
+        const chartContainer = document.getElementById('chart');
+        
+        // 创建图表实例
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: {
+                background: { type: 'solid', color: '#1a1a1a' },
+                textColor: '#d1d4dc',
+            },
+            grid: {
+                vertLines: { color: '#404040' },
+                horzLines: { color: '#404040' },
+            },
+            timeScale: {
+                timeVisible: true,
+                secondsVisible: false,
+                borderColor: '#404040',
+            },
+            rightPriceScale: {
+                borderColor: '#404040',
+            },
+        });
+
+        // 创建蜡烛系列 (这行代码在 v4 版本下是有效的)
+        let candlestickSeries = null;
+        try {
+            candlestickSeries = chart.addCandlestickSeries({
+                upColor: '#26a69a', 
+                downColor: '#ef5350', 
+                borderVisible: false,
+                wickUpColor: '#26a69a', 
+                wickDownColor: '#ef5350',
+            });
+        } catch (e) {
+            console.error("图表初始化失败，可能是库版本不对:", e);
+            document.getElementById('status').innerText = "图表组件加载失败";
+        }
+
+        // --- 2. 加载数据函数 ---
+        async function loadChart() {
+            const itemId = document.getElementById('itemId').value;
+            const statusEl = document.getElementById('status');
+            
+            statusEl.innerText = `正在获取 ${itemId} 的数据...`;
+            statusEl.style.color = "#aaa";
+
+            try {
+                // 请求后端接口
+                // 注意：这里硬编码了 localhost:3000，确保你前后端都在本地运行
+                const res = await fetch(`http://localhost:3000/api/market/kline?itemId=${itemId}&resolution=60`);
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP error! status: ${res.status}`);
+                }
+
+                const json = await res.json();
+
+                if (json.success) {
+                    const data = json.data;
+                    console.log('K线数据获取成功:', data);
+                    
+                    if (data.length === 0) {
+                        statusEl.innerText = "该物品暂无成交记录";
+                        statusEl.style.color = "orange";
+                        // 清空图表
+                        candlestickSeries.setData([]);
+                        return;
+                    }
+
+                    // 填充数据
+                    if (candlestickSeries) {
+                        candlestickSeries.setData(data);
+                        // 自动缩放以显示所有数据
+                        chart.timeScale().fitContent();
+                        statusEl.innerText = `加载成功 (共 ${data.length} 条记录)`;
+                        statusEl.style.color = "#4caf50";
+                    }
+                } else {
+                    statusEl.innerText = "后端返回错误: " + json.error;
+                    statusEl.style.color = "red";
+                }
+            } catch (err) {
+                console.error(err);
+                statusEl.innerText = "网络请求失败，请检查控制台";
+                statusEl.style.color = "red";
+            }
+        }
+    </script>
+</body>
+</html>
