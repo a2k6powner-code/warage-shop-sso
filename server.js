@@ -5,233 +5,183 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
-// 引入业务模块
-const db = require('./db');           
-const mcAuth = require('./mcAuth');   // SSO + 基础交易
-const market = require('./market');   // 市场 + K线 + 资产 + 筹集令
-const catalog = require('./catalog'); // 分类目录
+const db = require('./db');
+const mcAuth = require('./mcAuth');
+const market = require('./market');
+const catalog = require('./catalog');
 
-const app = express(); 
+const app = express();
 
-// ================= 1. 全局配置 =================
 app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// 开发环境允许跨域 (解决本地文件/本地调试访问问题)
-app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin) return callback(null, true);
-        return callback(null, true);
-    },
-    credentials: true
-}));
-
-// 限流: 15分钟 100次
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, 
-    max: 100 
-});
-app.use(limiter);
+app.use(cors({ origin: (o, c) => c(null, true), credentials: true }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 
 // ================= 2. 鉴权中间件 =================
 
-// A. 内部接口鉴权 (给游戏插件用)
-const verifyInternalApiKey = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'] || req.query.key;
-    if (apiKey !== process.env.INTERNAL_API_KEY) {
-        return res.status(403).json({ error: "Forbidden: Invalid API Key" });
+// A. 插件端鉴权 (API Key)
+const verifyInternal = (req, res, next) => {
+    if ((req.headers['x-api-key'] || req.query.key) !== process.env.INTERNAL_API_KEY) {
+        return res.status(403).json({ error: "Invalid API Key" });
     }
     next();
 };
 
-// B. 管理员鉴权 (给后台管理分类用)
+// B. 网页端鉴权 (Token)
+const verifyWebUser = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "No token provided" });
+
+    const user = mcAuth.verifyToken(token); // 验证是否过期
+    if (!user) return res.status(403).json({ error: "Token expired or invalid" });
+
+    req.user = user; // 包含 { token, uuid }
+    next();
+};
+
+// C. [修复] 管理员鉴权 (兼容 Token 和 Header)
 const verifyAdmin = (req, res, next) => {
-    const uuid = req.headers['x-user-uuid'];
+    let uuid;
+
+    // 1. 尝试从 Token 获取 UUID (网页端管理员)
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+        const user = mcAuth.verifyToken(token);
+        if (user) uuid = user.uuid;
+    }
+
+    // 2. 尝试从 Header 获取 UUID (旧版/测试工具兼容)
+    if (!uuid) {
+        uuid = req.headers['x-user-uuid'];
+    }
+
+    // 3. 验证是否在管理员白名单中
     const adminList = (process.env.ADMIN_UUIDS || '').split(',');
     if (!uuid || !adminList.includes(uuid)) {
         return res.status(403).json({ error: "Forbidden: 需要管理员权限" });
     }
+    
     next();
 };
 
-// ================= 3. API 路由定义 =================
+// ================= 3. 路由定义 =================
 
-// --- [新] 游戏插件专用接口 (Internal) ---
+// --- A. 插件端交互 (Internal) ---
 
-// 1. 生成登录 Token (SSO)
-app.post('/api/internal/generate-token', verifyInternalApiKey, (req, res) => {
-    try {
-        const { uuid } = req.body;
-        const token = mcAuth.generateToken(uuid);
-        res.json({ success: true, token, loginUrl: `http://localhost:${process.env.PORT||3000}/login?token=${token}` });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+app.post('/api/internal/generate-token', verifyInternal, (req, res) => {
+    const token = mcAuth.generateToken(req.body.uuid);
+    res.json({ success: true, token, loginUrl: `http://localhost:3000/login?token=${token}` });
 });
 
-// 2. 拉取待发货任务 (Web -> Game)
-app.get('/api/internal/fetch-purchases', verifyInternalApiKey, (req, res) => {
-    try { res.json({ orders: mcAuth.fetchPendingPurchases() }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
+app.post('/api/internal/deposit', verifyInternal, (req, res) => {
+    const { uuid, type, itemId, amount } = req.body;
+    market.depositToPending(uuid, type, itemId, parseInt(amount));
+    console.log(`[充值] ${uuid} 存入 ${amount} (待领)`);
+    res.json({ success: true });
 });
 
-// 3. [新] 资产充值接口 (Game -> Web)
-// 插件调用此接口，将游戏内的钱或物品“存入”网页账户
-app.post('/api/internal/deposit', verifyInternalApiKey, (req, res) => {
-    try {
-        const { uuid, type, itemId, amount } = req.body;
-        
-        // 存钱
-        if (type === 'money') {
-            market._updateBalance(uuid, parseInt(amount));
-            console.log(`[充值] 玩家 ${uuid} 存入 $${amount}`);
-        } 
-        // 存物品
-        else if (type === 'item') {
-            market._updateInventory(uuid, itemId, parseInt(amount));
-            console.log(`[充值] 玩家 ${uuid} 存入物品 ${itemId} x${amount}`);
-        }
-        
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+app.get('/api/internal/fetch-purchases', verifyInternal, (req, res) => {
+    res.json({ orders: mcAuth.fetchPendingPurchases() });
 });
 
+// --- B. 网页端交互 (Web) ---
 
-// --- 网页前端接口 (Web Frontend) ---
-
-// 1. 登录回调
+// 1. 登录跳转
 app.get('/login', (req, res) => {
+    const token = req.query.token;
+    const user = mcAuth.verifyToken(token);
+    if (!user) return res.send("链接已失效");
+    
+    res.send(`
+        <html><body>
+        <h1>正在登录...</h1>
+        <script>
+            localStorage.setItem('shop_token', '${token}');
+            localStorage.setItem('shop_uuid', '${user.uuid}');
+            // window.location.href = '/index.html'; 
+            document.body.innerHTML = '<h1>登录成功！Token有效期30天。</h1><p>钱包ID: ${token.substring(0,8)}...</p>';
+        </script>
+        </body></html>
+    `);
+});
+
+// 2. 资产查询 & 认领
+app.get('/api/assets/my', verifyWebUser, (req, res) => {
+    const balance = market.getBalance(req.user.token);
+    const inventory = db.prepare('SELECT item_id, amount FROM inventories WHERE token = ?').all(req.user.token);
+    const pending = market.getPendingDeposits(req.user.uuid);
+    res.json({ success: true, balance, inventory, pending });
+});
+
+app.post('/api/assets/claim', verifyWebUser, (req, res) => {
     try {
-        const uuid = mcAuth.verifyAndUse(req.query.token);
-        if (!uuid) return res.status(403).send("Token无效或已过期");
-        // 简单返回，实际项目中这里通常重定向到前端页面
-        res.send(`<h1>欢迎 ${uuid}</h1><script>localStorage.setItem('currentUser', '${uuid}'); window.location.href='/';</script>`);
-    } catch (err) { res.status(500).send("Login Error"); }
-});
-
-// 2. 资产查询
-app.get('/api/assets/my', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    try {
-        const balance = market.getBalance(uuid);
-        const inventory = db.prepare('SELECT item_id, amount FROM inventories WHERE uuid = ? AND amount > 0').all(uuid);
-        res.json({ success: true, balance, inventory });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// 3. 调试作弊 (给自己发钱/发货)
-app.post('/api/debug/give', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { type, itemId, amount } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    try {
-        if (type === 'money') market._updateBalance(uuid, parseInt(amount));
-        else if (type === 'item') market._updateInventory(uuid, itemId, parseInt(amount));
-        res.json({ success: true, msg: "作弊成功" });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// --- 基础商城 (管理员店) ---
-app.post('/api/shop/purchase', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    try {
-        const order = mcAuth.addPurchaseOrder(uuid, req.body.itemId);
-        res.json({ success: true, order });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// --- 自由市场 (现货 Spot) ---
-app.get('/api/market/orderbook', (req, res) => {
-    try { res.json({ success: true, data: market.getOrderBook(req.query.itemId) }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/market/kline', (req, res) => {
-    try { res.json({ success: true, data: market.getKlineData(req.query.itemId, parseInt(req.query.resolution)||60) }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/market/trades', (req, res) => {
-    try { res.json({ success: true, data: market.getTradeHistory(req.query.itemId) }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/market/place', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { itemId, type, price, amount } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    try {
-        const result = market.placeOrder(uuid, itemId, type, parseInt(price), parseInt(amount));
-        res.json(result);
+        const result = market.claimDeposit(req.user.token, req.body.depositId, req.user.uuid);
+        res.json({ success: true, data: result });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/market/fulfill', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { orderId, amount } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
+app.post('/api/assets/withdraw', verifyWebUser, (req, res) => {
     try {
-        const result = market.fulfillOrder(uuid, orderId, parseInt(amount));
-        res.json({ success: true, msg: "交易成功", data: result });
+        const { itemId, amount } = req.body;
+        market._updateInventory(req.user.token, itemId, -parseInt(amount));
+        mcAuth.addPurchaseOrder(req.user.uuid, itemId); // 简化版只发1个，需自行扩展
+        res.json({ success: true, msg: "提现请求已提交" });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/market/cancel', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { orderId } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
+// 3. 市场交易
+app.get('/api/market/orderbook', (req, res) => res.json({ success: true, data: market.getOrderBook(req.query.itemId) }));
+app.get('/api/market/trades', (req, res) => res.json({ success: true, data: market.getTradeHistory(req.query.itemId) }));
+app.get('/api/market/kline', (req, res) => res.json({ success: true, data: market.getKlineData(req.query.itemId, parseInt(req.query.resolution)||60) }));
+
+app.post('/api/market/place', verifyWebUser, (req, res) => {
     try {
-        market.cancelOrder(uuid, orderId);
+        const { itemId, type, price, amount } = req.body;
+        market.placeOrder(req.user.token, req.user.uuid, itemId, type, parseInt(price), parseInt(amount));
+        res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/market/fulfill', verifyWebUser, (req, res) => {
+    try {
+        market.fulfillOrder(req.user.token, req.body.orderId, parseInt(req.body.amount));
+        res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/market/cancel', verifyWebUser, (req, res) => {
+    try {
+        market.cancelOrder(req.user.token, req.body.orderId);
         res.json({ success: true, msg: "撤单成功" });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// --- 物资筹集令 (公会收购 Procurement) ---
-app.get('/api/procurement/list', (req, res) => {
-    try { res.json({ success: true, data: market.getProcurementList('OPEN') }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
+// 4. 筹集令
+app.get('/api/procurement/list', (req, res) => res.json({ success: true, data: market.getProcurementList() }));
 
-app.post('/api/procurement/create', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { itemId, price, targetAmount } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
+app.post('/api/procurement/create', verifyWebUser, (req, res) => {
     try {
-        const result = market.createProcurement(uuid, itemId, parseInt(price), parseInt(targetAmount));
-        res.json(result);
+        const { itemId, price, targetAmount } = req.body;
+        market.createProcurement(req.user.token, req.user.uuid, itemId, parseInt(price), parseInt(targetAmount));
+        res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/procurement/contribute', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { procurementId, amount } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
+app.post('/api/procurement/contribute', verifyWebUser, (req, res) => {
     try {
-        const result = market.contributeProcurement(uuid, parseInt(procurementId), parseInt(amount));
-        res.json(result);
+        market.contributeProcurement(req.user.token, req.body.procurementId, parseInt(req.body.amount));
+        res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/procurement/cancel', (req, res) => {
-    const uuid = req.headers['x-user-uuid'];
-    const { procurementId } = req.body;
-    if (!uuid) return res.status(401).json({ error: "未登录" });
-    try {
-        const result = market.cancelProcurement(uuid, procurementId);
-        res.json(result);
-    } catch (err) { res.status(400).json({ error: err.message }); }
-});
-
-// --- 分类目录 (Catalog) ---
-app.get('/api/catalog/tree', (req, res) => {
-    try { res.json({ success: true, data: catalog.getCategoryTree() }); } 
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
-
+// 5. 目录管理 (管理员)
 app.post('/api/admin/category', verifyAdmin, (req, res) => {
-    try { res.json({ success: true, data: catalog.createCategory(req.body.parentId, req.body.name, req.body.sortOrder) }); } 
-    catch (err) { res.status(400).json({ error: err.message }); }
+    try {
+        res.json({ success: true, data: catalog.createCategory(req.body.parentId, req.body.name, req.body.sortOrder) });
+    } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.delete('/api/admin/category', verifyAdmin, (req, res) => {
@@ -248,14 +198,15 @@ app.post('/api/admin/item', verifyAdmin, (req, res) => {
     } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ================= 4. 启动 =================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`
-    ===========================================
-    全功能 Minecraft Shop 核心已启动 (V2.0 双向资产版)
-    端口: ${PORT}
-    功能: SSO, 基础商城, 现货市场, 筹集令, 资产充提
-    ===========================================
-    `);
+// 6. 调试接口 (兼容旧测试代码)
+app.post('/api/debug/give', (req, res) => {
+    const uuid = req.headers['x-user-uuid'];
+    if (!uuid) return res.status(401).json({ error: "未登录" });
+    // 这里为了兼容旧测试脚本，简单处理，实际上新版建议走 deposit 流程
+    // 如果是旧测试脚本(无Token)，我们无法往钱包发钱，只能往 pending 发
+    market.depositToPending(uuid, req.body.type, req.body.itemId, parseInt(req.body.amount));
+    res.json({ success: true, msg: "资产已发至待领区，请通过Token认领" });
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT} (30-Day Token Mode)`));

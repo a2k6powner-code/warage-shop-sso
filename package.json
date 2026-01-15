@@ -1,19 +1,21 @@
 {
-  "name": "mc-shop-core",
+  "name": "minecraft-web-shop",
   "version": "2.0.0",
+  "description": "Minecraft Server Web Shop & Economy System",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test_token_economy.js"
   },
   "dependencies": {
-    "axios": "^1.13.2",
-    "better-sqlite3": "^12.6.0",
+    "better-sqlite3": "^11.8.1",
     "cors": "^2.8.5",
-    "dotenv": "^16.6.1",
-    "express": "^4.22.1",
-    "express-rate-limit": "^6.11.2",
-    "helmet": "^7.2.0",
-    "js-yaml": "^4.1.1",
-    "uuid": "^9.0.1"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0"
+  },
+  "devDependencies": {
+    "axios": "^1.7.9"
   }
 }
